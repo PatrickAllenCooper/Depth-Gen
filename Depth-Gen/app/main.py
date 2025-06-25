@@ -11,13 +11,20 @@ from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
 app = FastAPI(title="Depth-Gen: Apple Depth Pro Server", version="0.1.0")
 
 # -----------------------------------------------------------------------------
-# Device selection optimised for Apple Silicon.
-# Prefer MPS if available (Apple GPU). Fallback to CUDA then CPU.
+# Device selection optimized for CUDA first, then MPS, then CPU.
+# Prioritize CUDA for Windows/RTX systems.
 # -----------------------------------------------------------------------------
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
+if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
+    print(f"CUDA available! Using GPU: {torch.cuda.get_device_name(0)}")
+    # Enable CUDA optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    # Enable MPS fallback for unsupported operations
+    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 else:
     DEVICE = torch.device("cpu")
 
@@ -28,8 +35,21 @@ MODEL_REPO = os.getenv("DEPTH_MODEL_REPO", "apple/DepthPro-hf")
 
 try:
     image_processor: DepthProImageProcessorFast = DepthProImageProcessorFast.from_pretrained(MODEL_REPO)
-    model: DepthProForDepthEstimation = DepthProForDepthEstimation.from_pretrained(MODEL_REPO).to(DEVICE)
+    model: DepthProForDepthEstimation = DepthProForDepthEstimation.from_pretrained(
+        MODEL_REPO,
+        torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+        low_cpu_mem_usage=True
+    ).to(DEVICE)
     model.eval()
+    
+    # Compile model for better performance if using CUDA
+    if DEVICE.type == "cuda" and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("Model compiled for CUDA optimization")
+        except Exception as e:
+            print(f"Model compilation failed (continuing): {e}")
+            
 except Exception as e:
     raise RuntimeError(f"Failed to load DepthPro model from {MODEL_REPO}: {e}") from e
 
@@ -39,7 +59,7 @@ except Exception as e:
 # -----------------------------------------------------------------------------
 
 def _predict_depth(img: Image.Image) -> Tuple[Image.Image, float, float]:
-    """Run depth prediction and post-process.
+    """Run depth prediction and post-process with CUDA optimizations.
 
     Returns
     -------
@@ -48,19 +68,33 @@ def _predict_depth(img: Image.Image) -> Tuple[Image.Image, float, float]:
     fov : float
     focal_length_px : float
     """
-    inputs = image_processor(images=img, return_tensors="pt").to(DEVICE)
+    # Clear CUDA cache before processing
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    
+    # Use autocast for CUDA mixed precision
+    with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == "cuda")):
+        inputs = image_processor(images=img, return_tensors="pt").to(DEVICE)
 
-    with torch.no_grad():
-        outputs = model(**inputs)
+        with torch.no_grad():
+            outputs = model(**inputs)
 
-    post_processed = image_processor.post_process_depth_estimation(
-        outputs, target_sizes=[(img.height, img.width)]
-    )[0]
+        post_processed = image_processor.post_process_depth_estimation(
+            outputs, target_sizes=[(img.height, img.width)]
+        )[0]
 
-    depth = post_processed["predicted_depth"]
-    depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
-    depth = depth.clip(0, 255).to(torch.uint8)
-    depth_np = depth.detach().cpu().numpy()
+        depth = post_processed["predicted_depth"]
+        depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+        depth = depth.clip(0, 255).to(torch.uint8)
+        depth_np = depth.detach().cpu().numpy()
+        
+        # Clear intermediate tensors
+        del inputs, outputs, depth
+    
+    # Clear CUDA cache after processing
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    
     depth_img = Image.fromarray(depth_np)
 
     return depth_img, post_processed["field_of_view"], post_processed["focal_length"]

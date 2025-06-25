@@ -1,6 +1,10 @@
 fastapi>=0.111
 uvicorn[standard]>=0.29
 pillow>=10.2
-transformers>=4.39
+transformers>=4.52.0
 accelerate>=0.27
-torch==2.2.0 
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+tqdm>=4.65.0
+numpy>=1.21.0 

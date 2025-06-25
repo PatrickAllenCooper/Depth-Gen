@@ -250,18 +250,21 @@ class TemporalConsistencyProcessor:
         
         # Convert frame to grayscale for optical flow
         if len(current_frame.shape) == 3:
-            gray_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2GRAY)
+            # Ensure correct data type for OpenCV
+            frame_uint8 = current_frame.astype(np.uint8)
+            gray_frame = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2GRAY)
         else:
-            gray_frame = current_frame
+            gray_frame = current_frame.astype(np.uint8)
         
         # Add to buffers
         self.frame_buffer.append(gray_frame)
         
         # If this is the first frame, just return current depth
         if len(self.frame_buffer) < 2:
-            self.depth_buffer.append(current_depth.copy())
+            depth_copy = current_depth.astype(np.float32)
+            self.depth_buffer.append(depth_copy)
             self.stats['frames_processed'] += 1
-            return current_depth
+            return current_depth.astype(np.uint8)
         
         # Get previous frame and depth
         prev_frame = self.frame_buffer[-2]
@@ -276,13 +279,17 @@ class TemporalConsistencyProcessor:
         # Detect occlusions
         occlusion_mask = self.detect_occlusions(flow, confidence)
         
+        # Ensure consistent data types for processing
+        current_depth_f32 = current_depth.astype(np.float32)
+        warped_depth_f32 = warped_depth.astype(np.float32)
+        
         # Blend current and warped depth
         blended_depth = self.blend_depth_maps(
-            current_depth, warped_depth, confidence, occlusion_mask
+            current_depth_f32, warped_depth_f32, confidence, occlusion_mask
         )
         
-        # Add to depth buffer
-        self.depth_buffer.append(blended_depth)
+        # Add to depth buffer (store as float32 for precision)
+        self.depth_buffer.append(blended_depth.astype(np.float32))
         
         # Update statistics
         flow_magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
@@ -297,7 +304,8 @@ class TemporalConsistencyProcessor:
         self.stats['processing_time'] = (n * self.stats['processing_time'] + processing_time) / (n + 1)
         self.stats['frames_processed'] += 1
         
-        return blended_depth
+        # Return as uint8 for compatibility with video processing
+        return blended_depth.astype(np.uint8)
     
     def get_stats(self) -> Dict[str, float]:
         """Get processing statistics."""

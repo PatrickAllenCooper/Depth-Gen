@@ -14,6 +14,10 @@ from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
 from pathlib import Path
 import time
 
+# Suppress torch dynamo compilation errors
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 # Device selection optimized for CUDA
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -55,14 +59,8 @@ def load_model_optimized():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             
-            # Compile model for better performance (if available)
-            if hasattr(torch, 'compile'):
-                print("Compiling model for CUDA...")
-                try:
-                    model = torch.compile(model, mode="reduce-overhead")
-                    print("Model compilation successful!")
-                except Exception as e:
-                    print(f"Model compilation failed (continuing without): {e}")
+            # Skip model compilation for now due to Triton dependency issues
+            print("Skipping model compilation (using regular CUDA mode)")
         
         print("Model loaded and optimized successfully!")
         return image_processor, model

@@ -16,6 +16,15 @@ from pathlib import Path
 import time
 from tqdm import tqdm
 
+# Completely disable torch compilation
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.disable = True
+
+# Disable torch.compile globally
+original_compile = torch.compile
+torch.compile = lambda *args, **kwargs: args[0]  # Return model unchanged
+
 # Device selection optimized for CUDA
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -60,14 +69,8 @@ class VideoDepthProcessor:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
                 
-                # Model compilation for CUDA
-                if hasattr(torch, 'compile'):
-                    print("Compiling model for CUDA...")
-                    try:
-                        self.model = torch.compile(self.model, mode="reduce-overhead")
-                        print("Model compilation successful!")
-                    except Exception as e:
-                        print(f"Model compilation failed (continuing): {e}")
+                # Skip model compilation for now due to Triton dependency issues
+                print("Skipping model compilation (using regular CUDA mode)")
             
             print("Model loaded and optimized successfully!")
             
@@ -90,8 +93,15 @@ class VideoDepthProcessor:
             torch.cuda.empty_cache()
         
         try:
-            # Use autocast for CUDA mixed precision
-            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == "cuda")):
+            # Use autocast for CUDA mixed precision, but disable it if there are issues
+            use_autocast = DEVICE.type == "cuda"
+            
+            if use_autocast:
+                context = torch.autocast(device_type=DEVICE.type, dtype=torch.float16)
+            else:
+                context = torch.no_grad()
+            
+            with context:
                 inputs = self.image_processor(images=img, return_tensors="pt").to(DEVICE)
                 
                 with torch.no_grad():
@@ -103,8 +113,16 @@ class VideoDepthProcessor:
                 
                 depth = post_processed["predicted_depth"]
                 
-                # Normalize to 0-255 range
-                depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+                # Normalize to 0-255 range with safety checks
+                if depth.numel() == 0:
+                    raise ValueError("Empty depth tensor")
+                    
+                depth_min, depth_max = depth.min(), depth.max()
+                if depth_max > depth_min:
+                    depth = (depth - depth_min) / (depth_max - depth_min) * 255.0
+                else:
+                    depth = torch.zeros_like(depth) + 128.0  # Mid-gray fallback
+                    
                 depth = depth.clip(0, 255).to(torch.uint8)
                 depth_np = depth.detach().cpu().numpy()
                 
@@ -113,7 +131,26 @@ class VideoDepthProcessor:
                 
         except Exception as e:
             print(f"Error during depth prediction: {e}")
-            return None
+            # Try without autocast as fallback
+            if use_autocast and "autocast" not in str(e).lower():
+                try:
+                    with torch.no_grad():
+                        inputs = self.image_processor(images=img, return_tensors="pt").to(DEVICE)
+                        outputs = self.model(**inputs)
+                        post_processed = self.image_processor.post_process_depth_estimation(
+                            outputs, target_sizes=[(img.height, img.width)]
+                        )[0]
+                        depth = post_processed["predicted_depth"]
+                        depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+                        depth = depth.clip(0, 255).to(torch.uint8)
+                        depth_np = depth.detach().cpu().numpy()
+                        del inputs, outputs, depth
+                        print(f"Fallback without autocast succeeded for frame")
+                except Exception as e2:
+                    print(f"Fallback also failed: {e2}")
+                    return None
+            else:
+                return None
         
         # Clear cache
         if DEVICE.type == "cuda":
@@ -185,14 +222,28 @@ class VideoDepthProcessor:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(frame_rgb)
                 
-                # Generate depth map
-                depth_np = self.predict_depth(pil_img, max_size=max_size)
+                # Generate depth map with retry logic
+                depth_np = None
+                max_retries = 3
                 
+                for retry in range(max_retries):
+                    try:
+                        depth_np = self.predict_depth(pil_img, max_size=max_size)
+                        if depth_np is not None:
+                            break
+                        else:
+                            print(f"Retry {retry + 1}/{max_retries} for frame {frame_count}")
+                    except Exception as e:
+                        print(f"Retry {retry + 1}/{max_retries} failed for frame {frame_count}: {e}")
+                        if DEVICE.type == "cuda":
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        time.sleep(0.1)  # Brief pause before retry
+                
+                # If all retries failed, create a fallback depth map (black/zero depth)
                 if depth_np is None:
-                    print(f"Warning: Skipping frame {frame_count} due to processing error")
-                    pbar.update(1)
-                    frame_count += 1
-                    continue
+                    print(f"Creating fallback depth map for frame {frame_count}")
+                    depth_np = np.zeros((height, width), dtype=np.uint8)
                 
                 # Create output frame based on format
                 if output_format == 'depth_only':

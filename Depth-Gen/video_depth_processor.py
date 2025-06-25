@@ -16,6 +16,9 @@ from pathlib import Path
 import time
 from tqdm import tqdm
 
+# Import temporal consistency module
+from temporal_consistency import create_temporal_processor, TemporalConsistencyProcessor
+
 # Completely disable torch compilation
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
@@ -39,11 +42,21 @@ else:
 print(f"Using device: {DEVICE}")
 
 class VideoDepthProcessor:
-    def __init__(self, model_repo: str = "apple/DepthPro-hf"):
+    def __init__(self, model_repo: str = "apple/DepthPro-hf", enable_temporal_consistency: bool = True):
         self.model_repo = model_repo
         self.image_processor = None
         self.model = None
+        self.enable_temporal_consistency = enable_temporal_consistency
+        self.temporal_processor = None
         self.load_model()
+        
+        # Initialize temporal consistency processor if enabled
+        if self.enable_temporal_consistency:
+            self.temporal_processor = create_temporal_processor(
+                temporal_window=3,
+                flow_confidence_threshold=0.6,
+                blend_alpha=0.75
+            )
     
     def load_model(self):
         """Load model with CUDA optimizations"""
@@ -78,8 +91,8 @@ class VideoDepthProcessor:
             print(f"Failed to load model: {e}")
             raise
     
-    def predict_depth(self, img: Image.Image, max_size: int = 1536) -> np.ndarray:
-        """Generate depth map from PIL Image"""
+    def predict_depth(self, img: Image.Image, max_size: int = 1536, frame_rgb: np.ndarray = None) -> np.ndarray:
+        """Generate depth map from PIL Image with optional temporal consistency"""
         original_size = img.size
         
         # Resize if too large
@@ -163,6 +176,10 @@ class VideoDepthProcessor:
             depth_img = depth_img.resize(original_size, Image.Resampling.LANCZOS)
             depth_np = np.array(depth_img)
         
+        # Apply temporal consistency if enabled and frame provided
+        if self.enable_temporal_consistency and self.temporal_processor is not None and frame_rgb is not None:
+            depth_np = self.temporal_processor.process_frame(frame_rgb, depth_np)
+        
         return depth_np
     
     def process_video(self, input_path: str, output_path: str, 
@@ -208,6 +225,11 @@ class VideoDepthProcessor:
         print(f"Output video: {out_width}x{out_height}")
         print(f"Processing {total_frames} frames...")
         
+        # Reset temporal consistency processor for new video
+        if self.enable_temporal_consistency and self.temporal_processor is not None:
+            self.temporal_processor.reset()
+            print("Temporal consistency enabled: reducing flickering with optical flow")
+        
         # Process frames
         frame_count = 0
         start_time = time.time()
@@ -222,13 +244,14 @@ class VideoDepthProcessor:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(frame_rgb)
                 
-                # Generate depth map with retry logic
+                # Generate depth map with retry logic and temporal consistency
                 depth_np = None
                 max_retries = 3
                 
                 for retry in range(max_retries):
                     try:
-                        depth_np = self.predict_depth(pil_img, max_size=max_size)
+                        # Pass RGB frame for temporal consistency
+                        depth_np = self.predict_depth(pil_img, max_size=max_size, frame_rgb=frame_rgb)
                         if depth_np is not None:
                             break
                         else:
@@ -300,9 +323,13 @@ class VideoDepthProcessor:
         if DEVICE.type == "cuda":
             peak_memory = torch.cuda.max_memory_allocated() / 1024**3
             print(f"✓ Peak GPU memory usage: {peak_memory:.1f}GB")
+        
+        # Print temporal consistency statistics
+        if self.enable_temporal_consistency and self.temporal_processor is not None:
+            self.temporal_processor.print_stats()
 
 def main():
-    parser = argparse.ArgumentParser(description="Process video for depth estimation")
+    parser = argparse.ArgumentParser(description="Process video for depth estimation with temporal consistency")
     parser.add_argument("input", help="Input video path")
     parser.add_argument("-o", "--output", help="Output video path (default: input_depth.mp4)")
     parser.add_argument("--max-size", type=int, default=1536, 
@@ -312,6 +339,14 @@ def main():
                        help="Output format (default: side_by_side)")
     parser.add_argument("--model", default="apple/DepthPro-hf",
                        help="Model repository (default: apple/DepthPro-hf)")
+    
+    # Temporal consistency options
+    parser.add_argument("--no-temporal-consistency", action="store_true",
+                       help="Disable temporal consistency (may cause flickering)")
+    parser.add_argument("--temporal-strength", type=float, default=0.75,
+                       help="Temporal consistency strength (0.0-1.0, default: 0.75)")
+    parser.add_argument("--temporal-window", type=int, default=3,
+                       help="Temporal window size (default: 3 frames)")
     
     args = parser.parse_args()
     
@@ -326,8 +361,21 @@ def main():
         return 1
     
     try:
-        # Create processor and process video
-        processor = VideoDepthProcessor(model_repo=args.model)
+        # Create processor with temporal consistency configuration
+        enable_temporal = not args.no_temporal_consistency
+        processor = VideoDepthProcessor(
+            model_repo=args.model, 
+            enable_temporal_consistency=enable_temporal
+        )
+        
+        # Configure temporal consistency if enabled
+        if enable_temporal and processor.temporal_processor is not None:
+            processor.temporal_processor.blend_alpha = args.temporal_strength
+            processor.temporal_processor.temporal_window = args.temporal_window
+            print(f"Temporal consistency configured:")
+            print(f"  - Strength: {args.temporal_strength}")
+            print(f"  - Window: {args.temporal_window} frames")
+        
         processor.process_video(
             input_path=args.input,
             output_path=args.output,

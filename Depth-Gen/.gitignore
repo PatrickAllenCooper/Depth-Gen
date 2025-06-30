@@ -55,4 +55,33 @@ coverage.xml
 # Logs
 *.log
 # local data
-/data/ 
+/data/
+
+# Voxel mapping outputs
+*_voxel_output/
+*_voxel_output_*/
+voxel_output/
+voxel_test_output/
+depth_video_voxels/
+depth_video_voxel_output/
+single_frame_voxel_output/
+single_frame_voxel_output_adjusted/
+voxel_video_output/
+demo_voxel_output/
+
+# Large video files
+*.mp4
+*.avi
+*.mov
+
+# Test frames (already in repo)
+test_frames/
+
+# Temporal test results
+temporal_test_results/
+
+# PLY files (3D models)
+*.ply
+
+# NPZ files (numpy archives)
+*.npz 
